@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-// --- 环境变量恢复 ---
+// --- 环境变量 ---
 const PORT = process.env.PORT || 8080;
 const DEFAULT_SAVE_PATH = process.env.DEFAULT_SAVE_PATH || './download';
 const API_KEY = process.env.API_KEY;
@@ -15,7 +15,7 @@ const HTTPS_PROXY = process.env.HTTPS_PROXY || process.env.https_proxy;
 const LOG_FILE = 'node.log';
 const MAX_LOG_LINES = 1000;
 
-// 确保根目录下的 tmp 存在
+// 确保基础目录存在
 const BASE_TMP_PATH = path.resolve(__dirname, 'tmp');
 if (!fs.existsSync(BASE_TMP_PATH)) fs.mkdirSync(BASE_TMP_PATH, { recursive: true });
 
@@ -47,10 +47,10 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',           // 关键：解决 Docker 下卡死
+        '--disable-gpu', // 关键：解决 Docker 下卡死
         '--disable-software-rasterizer',
         '--disable-blink-features=AutomationControlled'
-    ];
+    ];    
     if (HTTPS_PROXY) {
         browserArgs.push(`--proxy-server=${HTTPS_PROXY}`);
         writeLog(`[${taskId}] 启用代理: ${HTTPS_PROXY}`);
@@ -97,10 +97,10 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
                 break;
             }
 
-            if (i % 5 === 0) {
+            if (i % 5 === 0 && !isDownloading) {
                 const currentCookies = await page.cookies();
-                if (currentCookies.some(c => c.name === 'c_token') && !isDownloading) {
-                    writeLog(`[${taskId}] 检测到 Token 已生成，强制刷新...`);
+                if (currentCookies.some(c => c.name === 'c_token')) {
+                    writeLog(`[${taskId}] 验证已过，尝试触发下载...`);
                     page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
                 }
             }
@@ -110,24 +110,27 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
         if (finalFileName) {
             const oldPath = path.join(taskTmpPath, finalFileName);
             const newPath = path.join(saveDir, finalFileName);
-            fs.renameSync(oldPath, newPath);
-            writeLog(`[${taskId}] 下载成功并保存至: ${newPath}`);
+            
+            // 解决 Docker 跨卷移动文件问题
+            fs.copyFileSync(oldPath, newPath);
+            fs.unlinkSync(oldPath);
+            
+            writeLog(`[${taskId}] 下载成功: ${finalFileName}`);
             res.write(JSON.stringify({ type: 'complete', message: '文件下载成功。', filePath: newPath, fileName: finalFileName }) + '\n');
             res.end();
         } else {
-            throw new Error("下载超时，任务结束");
+            throw new Error("下载超时");
         }
 
     } catch (err) {
-        writeLog(`[${taskId}] [ERROR] ${err.message}`, "ERROR");
-        const errorData = JSON.stringify({ type: 'error', message: '文件下载失败。', error: err.message }) + '\n';
+        writeLog(`[${taskId}] 错误: ${err.message}`, "ERROR");
+        const errorData = JSON.stringify({ type: 'error', message: '下载失败。', error: err.message }) + '\n';
         if (!res.headersSent) res.status(500).send(errorData);
         else res.write(errorData);
         res.end();
     } finally {
         if (fs.existsSync(taskTmpPath)) fs.rmSync(taskTmpPath, { recursive: true, force: true });
         await browser.close();
-        writeLog(`[${taskId}] 浏览器已关闭，资源释放`);
     }
 }
 
@@ -139,6 +142,7 @@ app.post('/download', async (req, res) => {
 
     if (!url || !cookie) return res.status(400).json({ message: '缺少参数' });
     if (API_KEY && api_key !== API_KEY) return res.status(403).json({ message: '无效 API KEY' });
+    if (!url || !cookie) return res.status(400).json({ message: '参数缺失' });
 
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
