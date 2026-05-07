@@ -19,7 +19,6 @@ const MAX_LOG_LINES = 1000;
 const BASE_TMP_PATH = path.resolve(__dirname, 'tmp');
 if (!fs.existsSync(BASE_TMP_PATH)) fs.mkdirSync(BASE_TMP_PATH, { recursive: true });
 
-// --- 日志系统 ---
 const formatTimestamp = () => {
     const now = new Date();
     return `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
@@ -37,17 +36,19 @@ const writeLog = (message) => {
     } catch (e) { console.error('日志写入失败:', e.message); }
 };
 
-// --- 下载核心逻辑 ---
 async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
     const taskId = crypto.randomBytes(8).toString('hex');
-    // 1. 在根目录 tmp 下创建独立任务文件夹
     const taskTmpPath = path.join(BASE_TMP_PATH, `task_${taskId}`);
     if (!fs.existsSync(taskTmpPath)) fs.mkdirSync(taskTmpPath, { recursive: true });
 
-    // 2. 配置代理
+    writeLog(`[${taskId}] 正在准备启动浏览器...`);
+
     const browserArgs = [
         '--no-sandbox',
+        '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-gpu',           // 关键：解决 Docker 下卡死
+        '--disable-software-rasterizer',
         '--disable-blink-features=AutomationControlled'
     ];
     if (HTTPS_PROXY) {
@@ -57,17 +58,16 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
 
     const browser = await puppeteer.launch({
         headless: "new",
-        // 优先使用环境变量指定的路径，如果没有则由 puppeteer 自己决定
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
         args: browserArgs
     });
 
+    writeLog(`[${taskId}] 浏览器已成功启动`);
 
     try {
         const page = await browser.newPage();
         const client = await page.target().createCDPSession();
         
-        // 设置下载到该任务的专属临时目录
         await client.send('Page.setDownloadBehavior', {
             behavior: 'allow',
             downloadPath: taskTmpPath,
@@ -81,13 +81,14 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
         await page.setCookie(...cookies);
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        writeLog(`[${taskId}] 开始访问并等待验证...`);
-        page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        writeLog(`[${taskId}] 正在打开下载页面...`);
+        page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(e => {
+            writeLog(`[${taskId}] 页面导航提示: ${e.message}`);
+        });
 
         let finalFileName = null;
         for (let i = 0; i < 90; i++) {
             const files = fs.readdirSync(taskTmpPath);
-            // 排除临时文件
             const readyFile = files.find(f => !f.endsWith('.crdownload') && !f.endsWith('.tmp') && !f.startsWith('.'));
             const isDownloading = files.some(f => f.endsWith('.crdownload'));
 
@@ -99,7 +100,7 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
             if (i % 5 === 0) {
                 const currentCookies = await page.cookies();
                 if (currentCookies.some(c => c.name === 'c_token') && !isDownloading) {
-                    writeLog(`[${taskId}] Token 已就绪，尝试触发下载...`);
+                    writeLog(`[${taskId}] 检测到 Token 已生成，强制刷新...`);
                     page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
                 }
             }
@@ -109,35 +110,35 @@ async function downloadWithPup(targetUrl, userCookie, saveDir, res) {
         if (finalFileName) {
             const oldPath = path.join(taskTmpPath, finalFileName);
             const newPath = path.join(saveDir, finalFileName);
-            
-            // 移动文件到最终目录
             fs.renameSync(oldPath, newPath);
-            writeLog(`[${taskId}] 下载成功并归档: ${finalFileName}`);
-            
+            writeLog(`[${taskId}] 下载成功并保存至: ${newPath}`);
             res.write(JSON.stringify({ type: 'complete', message: '文件下载成功。', filePath: newPath, fileName: finalFileName }) + '\n');
             res.end();
         } else {
-            throw new Error("下载超时或验证失败");
+            throw new Error("下载超时，任务结束");
         }
 
+    } catch (err) {
+        writeLog(`[${taskId}] [ERROR] ${err.message}`, "ERROR");
+        const errorData = JSON.stringify({ type: 'error', message: '文件下载失败。', error: err.message }) + '\n';
+        if (!res.headersSent) res.status(500).send(errorData);
+        else res.write(errorData);
+        res.end();
     } finally {
-        // 清理本次任务的临时目录
-        if (fs.existsSync(taskTmpPath)) {
-            fs.rmSync(taskTmpPath, { recursive: true, force: true });
-        }
+        if (fs.existsSync(taskTmpPath)) fs.rmSync(taskTmpPath, { recursive: true, force: true });
         await browser.close();
+        writeLog(`[${taskId}] 浏览器已关闭，资源释放`);
     }
 }
 
-// --- 接口定义 ---
 app.post('/download', async (req, res) => {
     const { url, cookie, save_path, api_key } = req.body;
     const clientIp = req.ip || req.connection.remoteAddress;
 
-    writeLog(`收到下载请求 - IP: ${clientIp}, URL: ${url}`);
+    writeLog(`>>> 收到请求 - IP: ${clientIp}, URL: ${url}`);
 
-    if (!url || !cookie) return res.status(400).json({ message: '缺少必要参数：url 和 cookie。' });
-    if (API_KEY && api_key !== API_KEY) return res.status(403).json({ message: '无效的 API Key。' });
+    if (!url || !cookie) return res.status(400).json({ message: '缺少参数' });
+    if (API_KEY && api_key !== API_KEY) return res.status(403).json({ message: '无效 API KEY' });
 
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
@@ -145,23 +146,9 @@ app.post('/download', async (req, res) => {
     const saveDir = save_path ? path.resolve(DEFAULT_SAVE_PATH, save_path) : path.resolve(DEFAULT_SAVE_PATH);
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
 
-    try {
-        await downloadWithPup(url, cookie, saveDir, res);
-    } catch (error) {
-        writeLog(`下载失败 - 错误: ${error.message} - IP: ${clientIp}`);
-        const errorData = JSON.stringify({ type: 'error', message: '文件下载失败。', error: error.message }) + '\n';
-        if (!res.headersSent) {
-            res.status(500).send(errorData);
-        } else {
-            res.write(errorData);
-            res.end();
-        }
-    }
+    await downloadWithPup(url, cookie, saveDir, res);
 });
 
 app.listen(PORT, () => {
-    writeLog(`=========================================`);
-    writeLog(`服务启动，监听端口 ${PORT}`);
-    writeLog(`代理状态: ${HTTPS_PROXY || '未启用'}`);
-    writeLog(`=========================================`);
+    writeLog(`服务就绪: http://localhost:${PORT}`);
 });
