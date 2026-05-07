@@ -13,6 +13,6 @@
     "axios": "^1.7.9",
     "express": "^4.21.2",
     "https-proxy-agent": "^7.0.5",
-    "http-proxy-agent": "^7.0.2"
+    "puppeteer": "^24.43.0"
   }
 }
